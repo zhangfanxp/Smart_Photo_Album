@@ -1,0 +1,5 @@
+# Compatibility alias for users of ModelScope's original google/embeddinggemma-2.
+# All original-model dependencies (including sentence-transformers[image] and
+# its PyTorch dependency) are now included in requirements.txt.
+# To install: uv pip install -r requirements-original.txt
+-r requirements.txt

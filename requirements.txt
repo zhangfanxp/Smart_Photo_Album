@@ -1,0 +1,24 @@
+# Smart Photo Album V2 | macOS Apple Silicon | Python 3.12
+# Install: uv pip install -r requirements.txt
+# To refresh eligible packages: uv pip install -U -r requirements.txt
+#
+# Qwen3-VL MLX + EmbeddingGemma 2 MLX 4-bit:
+# Pin the mlx-vlm revision recommended by the EmbeddingGemma 2 MLX model card.
+# This Git dependency still requires access to github.com, even if using a PyPI mirror.
+mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm.git@3d87e88402f307efbf68e568971aa887ee7d9ed0
+mlx>=0.32.3
+transformers>=5.18.0
+
+# The user's requested image extra. Also provides the SentenceTransformer
+# backend used for the original ModelScope google/embeddinggemma-2 checkpoint.
+# This dependency pulls in PyTorch and may be large on macOS.
+sentence-transformers[image]>=5.1.0
+
+# Local image preprocessing, vectors, CLI progress and model downloads.
+numpy>=1.26,<3
+Pillow>=10.0
+pillow-heif>=1.0
+tqdm>=4.66
+safetensors>=0.4
+modelscope>=1.0
+huggingface-hub>=0.30
