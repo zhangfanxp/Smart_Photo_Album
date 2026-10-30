@@ -17,7 +17,7 @@ from photo_core import (
     prepare_image, read_json, stat_signature, text_hash, timestamp,
     validate_model_path,
 )
-from prompts import ANALYSIS_PROMPT, PROMPT_VERSION
+from prompts import ANALYSIS_PROMPT, PROMPT_VERSION, RETRY_ANALYSIS_PROMPT
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,9 +121,28 @@ def main() -> int:
         scratch.mkdir(parents=True, exist_ok=True)
         for img in tqdm(pending, desc="识别图片", unit="张", dynamic_ncols=True):
             prepared = scratch / f"{image_id(img)}.jpg"
+            raw = ""
+            retried = False
             try:
                 prepare_image(img, prepared, args.max_side)
-                analysis, raw = analyzer.analyze(prepared, ANALYSIS_PROMPT, args.max_tokens)
+                try:
+                    analysis, raw = analyzer.analyze(prepared, ANALYSIS_PROMPT, args.max_tokens)
+                except ValueError as first_error:
+                    first_raw = getattr(analyzer, "last_raw", "")
+                    retried = True
+                    try:
+                        analysis, raw = analyzer.analyze(
+                            prepared, RETRY_ANALYSIS_PROMPT, max(args.max_tokens, 2600)
+                        )
+                    except Exception as retry_error:
+                        retry_raw = getattr(analyzer, "last_raw", "")
+                        raw = (
+                            f"首轮输出校验失败：{first_error}\n首轮模型输出：\n{first_raw}\n\n"
+                            f"紧凑重试失败：{retry_error}\n重试模型输出：\n{retry_raw}"
+                        )
+                        raise RuntimeError(
+                            f"首轮输出校验失败（{first_error}）；紧凑重试也失败（{retry_error}）"
+                        ) from retry_error
                 entry = {
                     "id": image_id(img),
                     "image_path": str(img),
@@ -138,10 +157,12 @@ def main() -> int:
                 }
                 atomic_json(meta_path(img), entry)
                 analyzed += 1
-                (ERROR_DIR / f"{image_id(img)}.txt").unlink(missing_ok=True)
+                if retried:
+                    tqdm.write(f"[精简重试成功] {img.name}")
             except Exception as exc:
                 failed[img] = str(exc)
-                raw = getattr(analyzer, "last_raw", "")
+                if not raw:
+                    raw = getattr(analyzer, "last_raw", "")
                 (ERROR_DIR / f"{image_id(img)}.txt").write_text(
                     f"文件: {img}\n错误: {exc}\n\n模型输出:\n{raw}", encoding="utf-8"
                 )
@@ -179,6 +200,7 @@ def main() -> int:
             print("已生成的 metadata/*.json 会被保留，修复环境后重新执行本命令即可续跑。")
             return 2
         for img, entry in tqdm(to_embed, desc="生成向量", unit="张", dynamic_ncols=True):
+            desc = ""
             try:
                 desc = entry["analysis"]["search_text"]
                 vector = encoder.encode(desc, query=False)
@@ -192,8 +214,13 @@ def main() -> int:
                     "created_at": timestamp(),
                 })
                 embedded += 1
+                (ERROR_DIR / f"{image_id(img)}.txt").unlink(missing_ok=True)
             except Exception as exc:
                 failed[img] = f"向量化失败：{exc}"
+                (ERROR_DIR / f"{image_id(img)}.txt").write_text(
+                    f"文件: {img}\n错误: 向量化失败：{exc}\n\nsearch_text:\n{desc}",
+                    encoding="utf-8",
+                )
                 tqdm.write(f"[向量化失败] {img.name}: {exc}")
         del encoder
         gc.collect()
@@ -201,10 +228,19 @@ def main() -> int:
         print("第二阶段：向量缓存有效，跳过。")
 
     valid_count = 0
+    incomplete = []
     for img in files:
         entry = read_json(meta_path(img))
-        if entry and is_analysis_current(img, entry, vlm_model, stats.get(img)) and is_vector_current(img, entry, embed_model):
+        analysis_ok = bool(entry and is_analysis_current(img, entry, vlm_model, stats.get(img)))
+        vector_ok = bool(analysis_ok and is_vector_current(img, entry, embed_model))
+        if vector_ok:
             valid_count += 1
+            (ERROR_DIR / f"{image_id(img)}.txt").unlink(missing_ok=True)
+        else:
+            reason = failed.get(img)
+            if not reason:
+                reason = "图片识别结果缺失或已过期" if not analysis_ok else "向量缺失或已过期"
+            incomplete.append((img, reason))
 
     print("\n" + "=" * 48)
     print(f"扫描图片：{len(files)} 张 | 本次识别：{analyzed} 张 | 本次向量化：{embedded} 张")
@@ -217,6 +253,8 @@ def main() -> int:
         return 0
     print(f"⚠️ 部分图片尚未完成，共 {len(files)-valid_count} 张。可再次运行相同命令续跑。")
     print(f"识别错误详情：{ERROR_DIR}")
+    for img, reason in incomplete:
+        print(f"未完成：{img.name} — {reason}", file=sys.stderr)
     return 1
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -98,8 +99,12 @@ def read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def read_model_json(raw: str) -> dict[str, Any]:
-    """Decode JSON even if a small model wraps it in markdown or extra text."""
+def read_model_json(raw: str, *, required_keys: set[str] | None = None) -> dict[str, Any]:
+    """Decode a JSON object, optionally requiring expected top-level fields.
+
+    The top-level check prevents a truncated analysis response from being
+    mistaken for a valid nested object such as ``people`` or ``scene``.
+    """
     raw = raw.strip()
     decoder = json.JSONDecoder()
     for i, char in enumerate(raw):
@@ -109,8 +114,11 @@ def read_model_json(raw: str) -> dict[str, Any]:
             value, _ = decoder.raw_decode(raw[i:])
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict):
+        if isinstance(value, dict) and (required_keys is None or required_keys.issubset(value)):
             return value
+    if required_keys:
+        names = ", ".join(sorted(required_keys))
+        raise ValueError(f"模型未返回包含顶层字段 [{names}] 的完整 JSON；输出可能被截断")
     raise ValueError("模型未返回有效 JSON")
 
 
@@ -124,6 +132,67 @@ def _integer(value: Any, default: int = 0) -> int:
 
 def _is_true(value: Any) -> bool:
     return value is True  # never interpret unknown/strings as exact
+
+
+_FLAG_TERM = re.compile(r"旗帜|旗子|国旗|党旗|flag", re.IGNORECASE)
+_RED_TERM = re.compile(r"红色?|鲜红(?:色)?|\bred\b", re.IGNORECASE)
+_EXPLICIT_RED_FLAG = re.compile(
+    r"五星红旗|红旗|(?:红色|鲜红色?)(?:的)?旗(?:帜|子)?|红色党旗|\bred\s+flag\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_RED_HANDPRINT = re.compile(r"红(?:色)?手(?:掌)?印|手(?:掌)?印(?:是|为)?红(?:色)?")
+
+
+def _red_flag_evidence(analysis: dict[str, Any]) -> bool | None:
+    """Return true only when indexed text explicitly describes a red flag.
+
+    Missing flag mentions are unknown rather than proof of absence: older
+    annotations may not list every background object.
+    """
+    objects = analysis.get("objects", [])
+    if not isinstance(objects, list):
+        objects = []
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        text = " ".join(str(obj.get(key) or "") for key in ("name", "attributes"))
+        if _EXPLICIT_RED_FLAG.search(text):
+            return True
+        if _FLAG_TERM.search(text) and _RED_TERM.search(text):
+            return True
+
+    # Tags are concise labels, so an explicit red-flag phrase is useful
+    # evidence. Avoid combining unrelated red objects and flags across fields.
+    tags = analysis.get("tags", [])
+    if isinstance(tags, list) and any(
+        isinstance(tag, str) and _EXPLICIT_RED_FLAG.search(tag) for tag in tags
+    ):
+        return True
+    return None
+
+
+def _red_handprint_evidence(analysis: dict[str, Any]) -> bool | None:
+    """Return true only when a red handprint is explicitly described."""
+    objects = analysis.get("objects", [])
+    if not isinstance(objects, list):
+        objects = []
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        text = " ".join(str(obj.get(key) or "") for key in ("name", "attributes", "position"))
+        if _EXPLICIT_RED_HANDPRINT.search(text):
+            return True
+
+    for key in ("summary", "search_text"):
+        value = analysis.get(key)
+        if isinstance(value, str) and _EXPLICIT_RED_HANDPRINT.search(value):
+            return True
+    tags = analysis.get("tags", [])
+    if isinstance(tags, list) and any(
+        isinstance(tag, str) and _EXPLICIT_RED_HANDPRINT.search(tag) for tag in tags
+    ):
+        return True
+    return None
 
 
 def validate_analysis(a: dict[str, Any]) -> dict[str, Any]:
@@ -184,6 +253,17 @@ def derive_filters(a: dict[str, Any]) -> dict[str, Any]:
     acount = animals.get("count")
     animal_exact = animals.get("count_exact") is True and type(acount) is int and acount == len(animals.get("items") or [])
     scene = a.get("scene") or {}
+    if not isinstance(scene, dict):
+        scene = {}
+    sky_blue = scene.get("sky_blue")
+    if type(sky_blue) is not bool:
+        sky_blue = None
+    red_flag_visible = scene.get("red_flag_visible")
+    if type(red_flag_visible) is not bool:
+        red_flag_visible = _red_flag_evidence(a)
+    red_handprint_visible = scene.get("red_handprint_visible")
+    if type(red_handprint_visible) is not bool:
+        red_handprint_visible = _red_handprint_evidence(a)
     return {
         "people_count": total,
         "people_count_exact": exact,
@@ -198,8 +278,19 @@ def derive_filters(a: dict[str, Any]) -> dict[str, Any]:
         "child_count": count_person(ages=child_ages),
         "adult_female_count": count_person({"female"}, adult_ages),
         "middle_aged_male_count": count_person({"male"}, {"middle_aged"}),
+        "person_details": [
+            {
+                "gender_presentation": gender(person),
+                "age_group": age(person),
+                "clothing": str(person.get("clothing") or ""),
+            }
+            for person in persons
+        ],
         "scene": str(scene.get("location_type") or ""),
         "time_of_day": str(scene.get("time_of_day") or ""),
+        "sky_blue": sky_blue,
+        "red_flag_visible": red_flag_visible,
+        "red_handprint_visible": red_handprint_visible,
     }
 
 
@@ -296,4 +387,5 @@ class ImageAnalyzer:
         )
         raw = output.text if hasattr(output, "text") else str(output)
         self.last_raw = raw
-        return validate_analysis(read_model_json(raw)), raw
+        required = {"image_type", "search_text", "people", "animals", "scene"}
+        return validate_analysis(read_model_json(raw, required_keys=required)), raw

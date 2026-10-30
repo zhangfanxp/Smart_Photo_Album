@@ -76,6 +76,7 @@ weights/
 # --------------------------------------------
 images/
 photos/
+pic/
 uploads/
 thumbnails/
 previews/
@@ -85,11 +86,13 @@ previews/
 # --------------------------------------------
 metadata/
 vectors/
+errors/
 embeddings/
 indexes/
 index/
 output/
 results/
+annotation_overrides.json
 
 *.npy
 *.npz
