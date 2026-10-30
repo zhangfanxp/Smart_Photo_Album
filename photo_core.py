@@ -107,6 +107,8 @@ def read_model_json(raw: str, *, required_keys: set[str] | None = None) -> dict[
     """
     raw = raw.strip()
     decoder = json.JSONDecoder()
+    best_candidate = None
+    best_score = -1
     for i, char in enumerate(raw):
         if char != "{":
             continue
@@ -114,11 +116,19 @@ def read_model_json(raw: str, *, required_keys: set[str] | None = None) -> dict[
             value, _ = decoder.raw_decode(raw[i:])
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and (required_keys is None or required_keys.issubset(value)):
+        if not isinstance(value, dict):
+            continue
+        if required_keys is None or required_keys.issubset(value):
             return value
+        score = len(required_keys.intersection(value))
+        if score > best_score:
+            best_candidate = value
+            best_score = score
     if required_keys:
-        names = ", ".join(sorted(required_keys))
-        raise ValueError(f"模型未返回包含顶层字段 [{names}] 的完整 JSON；输出可能被截断")
+        if best_candidate is not None:
+            missing = ", ".join(sorted(required_keys - best_candidate.keys()))
+            raise ValueError(f"模型返回了 JSON，但缺少必需的顶层字段 [{missing}]")
+        raise ValueError("模型未返回包含必需字段的完整 JSON 对象；输出可能被截断")
     raise ValueError("模型未返回有效 JSON")
 
 
@@ -195,11 +205,80 @@ def _red_handprint_evidence(analysis: dict[str, Any]) -> bool | None:
     return None
 
 
+def _synthesize_search_text(analysis: dict[str, Any]) -> str:
+    """Build a retrieval description from valid structured facts if omitted."""
+    parts: list[str] = []
+
+    def add(value: Any) -> None:
+        if not isinstance(value, str):
+            return
+        value = value.strip()
+        if not value or value.lower() in {"unknown", "null", "none"} or value in {"未知", "无法判断"}:
+            return
+        if value not in parts:
+            parts.append(value)
+
+    add(analysis.get("summary"))
+
+    people = analysis.get("people")
+    if isinstance(people, dict):
+        person_items = people.get("persons", [])
+        if isinstance(person_items, list):
+            for person in person_items[:4]:
+                if isinstance(person, dict):
+                    details = [person.get(key) for key in ("appearance", "clothing", "action", "position")]
+                    description = "，".join(str(value).strip() for value in details if isinstance(value, str) and value.strip())
+                    if description:
+                        add(f"人物：{description}")
+
+    animals = analysis.get("animals")
+    if isinstance(animals, dict):
+        animal_items = animals.get("items", [])
+        if isinstance(animal_items, list):
+            for animal in animal_items[:4]:
+                if isinstance(animal, dict):
+                    details = [animal.get(key) for key in ("species", "color", "action", "position")]
+                    description = "，".join(str(value).strip() for value in details if isinstance(value, str) and value.strip())
+                    if description:
+                        add(f"动物：{description}")
+
+    scene = analysis.get("scene")
+    if isinstance(scene, dict):
+        details = [scene.get(key) for key in ("location_type", "weather", "lighting", "background")]
+        description = "，".join(str(value).strip() for value in details if isinstance(value, str) and value.strip())
+        if description:
+            add(f"场景：{description}")
+
+    objects = analysis.get("objects")
+    if isinstance(objects, list):
+        for obj in objects[:8]:
+            if isinstance(obj, dict):
+                details = [obj.get(key) for key in ("name", "attributes", "position")]
+                description = "，".join(str(value).strip() for value in details if isinstance(value, str) and value.strip())
+                if description:
+                    add(description)
+
+    text_content = analysis.get("text_content")
+    visible_text = text_content.get("visible_text", []) if isinstance(text_content, dict) else []
+    if isinstance(visible_text, list):
+        for text in visible_text[:4]:
+            add(text)
+    tags = analysis.get("tags")
+    if isinstance(tags, list):
+        for tag in tags[:8]:
+            add(tag)
+
+    return "；".join(parts)[:350].rstrip("；，。 ")
+
+
 def validate_analysis(a: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(a.get("search_text"), str) or len(a["search_text"].strip()) < 8:
-        raise ValueError("模型输出缺少有效的 search_text")
-    a["search_text"] = a["search_text"].strip()
     a["summary"] = str(a.get("summary") or "").strip()
+    search_text = a.get("search_text")
+    if not isinstance(search_text, str) or len(search_text.strip()) < 8:
+        search_text = _synthesize_search_text(a)
+    if len(search_text.strip()) < 8:
+        raise ValueError("模型输出缺少有效的 search_text，且无法从结构化字段生成检索描述")
+    a["search_text"] = search_text.strip()
     a["categories"] = [s for s in a.get("categories", []) if isinstance(s, str)] if isinstance(a.get("categories"), list) else []
     a["tags"] = [s for s in a.get("tags", []) if isinstance(s, str)] if isinstance(a.get("tags"), list) else []
     if not isinstance(a.get("scene"), dict):
@@ -387,5 +466,6 @@ class ImageAnalyzer:
         )
         raw = output.text if hasattr(output, "text") else str(output)
         self.last_raw = raw
-        required = {"image_type", "search_text", "people", "animals", "scene"}
+        # search_text can be safely synthesized from the model's structured facts.
+        required = {"image_type", "summary", "people", "animals", "scene"}
         return validate_analysis(read_model_json(raw, required_keys=required)), raw
